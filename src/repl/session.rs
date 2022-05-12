@@ -29,7 +29,6 @@ use std::sync::{Arc, Mutex};
 #[cfg(feature = "cli")]
 use prettytable::{Cell, Row, Table};
 
-use super::settings::InitialLink;
 use super::SessionSettings;
 
 #[cfg(feature = "wasm")]
@@ -95,134 +94,6 @@ impl Session {
             settings,
             executed: Vec::new(),
         }
-    }
-
-    #[cfg(not(feature = "wasm"))]
-    fn retrieve_contract(
-        &mut self,
-        link: &InitialLink,
-    ) -> Result<(String, Vec<Dependency>), String> {
-        let contract_id = &link.contract_id;
-        let components: Vec<&str> = contract_id.split('.').collect();
-        let contract_deployer = components.first().expect("");
-        let contract_name = components.last().expect("");
-
-        let mut contract_source = None;
-        if let Some(ref cache_path) = link.cache {
-            let mut file_path = PathBuf::from(cache_path);
-            file_path.push(format!("{}.clar", contract_id));
-            if let Ok(data) = fs::read_to_string(file_path) {
-                contract_source = Some(data);
-            }
-        }
-
-        let code = if contract_source.is_none() {
-            let stacks_node_addr = match &link.stacks_node_addr {
-                Some(addr) => addr.clone(),
-                None => {
-                    if contract_id.starts_with("SP") {
-                        "https://stacks-node-api.mainnet.stacks.co".to_string()
-                    } else {
-                        "https://stacks-node-api.testnet.stacks.co".to_string()
-                    }
-                }
-            };
-
-            let request_url = format!(
-                "{host}/v2/contracts/source/{addr}/{name}?proof=0",
-                host = stacks_node_addr,
-                addr = contract_deployer,
-                name = contract_name
-            );
-
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            let response = rt.block_on(async { fetch_contract(request_url).await });
-            response.source.to_string()
-        } else {
-            contract_source.unwrap()
-        };
-
-        if self.settings.disk_cache_enabled {
-            if let Some(ref cache_path) = link.cache {
-                let mut file_path = PathBuf::from(cache_path);
-                let _ = fs::create_dir_all(&file_path);
-                file_path.push(format!("{}.clar", contract_id));
-
-                if let Ok(ref mut file) = File::create(file_path) {
-                    let _ = file.write_all(code.as_bytes());
-                }
-            }
-        }
-
-        let deps = self
-            .interpreter
-            .detect_dependencies(
-                contract_id.to_string(),
-                code.clone(),
-                self.settings.repl_settings.parser_version,
-            )
-            .unwrap();
-        Ok((code, deps))
-    }
-
-    #[cfg(not(feature = "wasm"))]
-    pub fn resolve_link(
-        &mut self,
-        link: &InitialLink,
-        retrieved: &mut BTreeSet<String>,
-    ) -> Result<Vec<(String, String, Vec<String>)>, String> {
-        let mut resolved_link = Vec::new();
-
-        let mut handled: HashMap<String, String> = HashMap::new();
-        let mut dependencies: HashMap<String, Vec<String>> = HashMap::new();
-        let mut queue = VecDeque::new();
-        queue.push_front(link.clone());
-
-        while let Some(initial_link) = queue.pop_front() {
-            if retrieved.contains(&initial_link.contract_id) {
-                continue;
-            }
-
-            let contract_id = &initial_link.contract_id;
-
-            // Extract principal from contract_id
-            let (contract_code, deps) = match handled.get(contract_id) {
-                Some(entry) => (entry.clone(), Vec::new()),
-                None => {
-                    let (contract_code, deps) = self
-                        .retrieve_contract(&initial_link)
-                        .expect("Unable to get contract");
-                    handled.insert(contract_id.to_string(), contract_code.clone());
-                    (contract_code, deps)
-                }
-            };
-
-            if deps.len() > 0 {
-                dependencies.insert(
-                    contract_id.to_string(),
-                    deps.clone()
-                        .into_iter()
-                        .map(|c| format!("{}", c.contract_id))
-                        .collect(),
-                );
-                for dep in deps.into_iter() {
-                    queue.push_back(InitialLink {
-                        contract_id: dep.contract_id.to_string(),
-                        cache: initial_link.cache.clone(),
-                        stacks_node_addr: initial_link.stacks_node_addr.clone(),
-                    });
-                }
-                queue.push_back(initial_link);
-            } else {
-                let deps = match dependencies.get(contract_id) {
-                    Some(deps) => deps.clone(),
-                    None => vec![],
-                };
-                resolved_link.push((contract_id.to_string(), contract_code, deps));
-            }
-        }
-
-        Ok(resolved_link)
     }
 
     #[cfg(not(feature = "wasm"))]
@@ -300,72 +171,6 @@ impl Session {
             0 => Ok((output.join("\n"), contracts)),
             _ => Err(output_err.join("\n")),
         }
-    }
-
-    #[cfg(not(feature = "wasm"))]
-    fn handle_requirements(&mut self) -> Result<Vec<String>, Vec<String>> {
-        let mut output_err = vec![];
-        let mut output = vec![];
-
-        let mut linked_contracts = Vec::new();
-
-        if self.settings.initial_links.len() > 0 {
-            let initial_links = self.settings.initial_links.clone();
-            let default_tx_sender = self.interpreter.get_tx_sender();
-
-            let mut retrieved = BTreeSet::new();
-
-            for link in initial_links.iter() {
-                if retrieved.contains(&link.contract_id) {
-                    continue;
-                }
-                let contracts = self.resolve_link(link, &mut retrieved).unwrap();
-                for (contract_id, code, _) in contracts.into_iter() {
-                    if !retrieved.contains(&contract_id) {
-                        retrieved.insert(contract_id.clone());
-                        linked_contracts.push((contract_id, code));
-                    }
-                }
-            }
-            for (contract_id, code) in linked_contracts.iter() {
-                let components: Vec<&str> = contract_id.split('.').collect();
-                let contract_deployer = components.first().expect("");
-                let contract_name = components.last().expect("");
-                if self
-                    .settings
-                    .include_boot_contracts
-                    .contains(&contract_name.to_string())
-                {
-                    continue;
-                }
-
-                let deployer = {
-                    PrincipalData::parse_standard_principal(&contract_deployer)
-                        .expect("Unable to parse deployer's address")
-                };
-
-                self.interpreter.set_tx_sender(deployer);
-                match self.formatted_interpretation(
-                    code.to_string(),
-                    Some(contract_name.to_string()),
-                    true,
-                    None,
-                    None,
-                ) {
-                    Ok((mut logs, _)) => output.append(&mut logs),
-                    Err(ref mut result) => {
-                        output_err.append(result);
-                        break;
-                    }
-                };
-            }
-
-            self.interpreter.set_tx_sender(default_tx_sender);
-        }
-        if output_err.len() > 0 {
-            return Err(output_err);
-        }
-        Ok(output)
     }
 
     fn handle_initial_contracts(
@@ -465,7 +270,6 @@ impl Session {
         &mut self,
     ) -> Result<(Vec<String>, Vec<(ContractAnalysis, String, String)>), Vec<String>> {
         if self.initial_contracts_analysis.is_empty() {
-            let output = self.handle_requirements()?;
             let (output, contracts) = self.handle_initial_contracts()?;
 
             self.initial_contracts_analysis
@@ -1389,6 +1193,10 @@ impl Session {
         };
         output.push(result);
     }
+
+    pub fn display_digest(&self) -> Result<String, String> {
+        Ok("".to_string())
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -1430,22 +1238,6 @@ fn decode_hex(byteString: &str) -> Result<Vec<u8>, DecodeHexError> {
         Ok(result) => Ok(result),
         Err(e) => Err(DecodeHexError::ParseError(e)),
     }
-}
-
-#[derive(Deserialize, Debug, Default, Clone)]
-struct Contract {
-    source: String,
-    publish_height: u32,
-}
-
-async fn fetch_contract(request_url: String) -> Contract {
-    let response: Contract = reqwest::get(&request_url)
-        .await
-        .expect("Unable to retrieve contract")
-        .json()
-        .await
-        .expect("Unable to parse contract");
-    return response;
 }
 
 fn build_api_reference() -> HashMap<String, String> {

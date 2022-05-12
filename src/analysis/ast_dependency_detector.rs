@@ -11,7 +11,6 @@ use crate::clarity::types::{
     TraitIdentifier, TypeSignature, Value,
 };
 use crate::clarity::{ClarityName, SymbolicExpressionType};
-use crate::repl::settings::InitialLink;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::iter::FromIterator;
